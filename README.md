@@ -7,8 +7,14 @@
   **Your tabs remember which branch they belong to.**
 
   <p align="center">
-    <a href="https://marketplace.visualstudio.com">
-      <img src="https://img.shields.io/badge/Marketplace-v1.0.0-2563eb?style=for-the-badge&logo=visualstudiocode&logoColor=white&labelColor=161b22" alt="Marketplace Version" />
+    <a href="https://marketplace.visualstudio.com/items?itemName=Saksham-Mann.gitrecall">
+      <img src="https://img.shields.io/badge/Marketplace-v1.0.1-2563eb?style=for-the-badge&logo=visualstudiocode&logoColor=white&labelColor=161b22" alt="Marketplace Version" />
+    </a>
+    <a href="https://github.com/Saksham-Mann/vscode-gitrecall">
+      <img src="https://img.shields.io/badge/GitHub-Repository-181717?style=for-the-badge&logo=github&logoColor=white&labelColor=161b22" alt="GitHub Repository" />
+    </a>
+    <a href="https://github.com/Saksham-Mann/vscode-gitrecall/issues">
+      <img src="https://img.shields.io/badge/Issues-Tracker-161b22?style=for-the-badge&logo=github&logoColor=white&labelColor=161b22" alt="Issue Tracker" />
     </a>
     <a href="src/test">
       <img src="https://img.shields.io/badge/Tests-57%20Passed-238636?style=for-the-badge&logo=mocha&logoColor=white&labelColor=161b22" alt="Test Suite" />
@@ -16,6 +22,14 @@
     <a href="LICENSE">
       <img src="https://img.shields.io/badge/License-MIT-d29922?style=for-the-badge&logo=opensourceinitiative&logoColor=white&labelColor=161b22" alt="License" />
     </a>
+  </p>
+
+  <p align="center">
+    <a href="https://github.com/Saksham-Mann/vscode-gitrecall">Repository</a>
+    &middot;
+    <a href="https://github.com/Saksham-Mann/vscode-gitrecall/issues">Issue Tracker</a>
+    &middot;
+    <a href="https://marketplace.visualstudio.com/items?itemName=Saksham-Mann.gitrecall">Marketplace</a>
   </p>
 
   <p align="center">
@@ -75,6 +89,12 @@ GitRecall stores state strictly in VS Code's local workspace storage (`context.w
 | **Single-root workspaces** | Tracks the active repository in single-root workspaces. Multi-root support is planned for a future release. |
 | **Local storage only** | State is saved in local workspace storage and does not sync across machines via Settings Sync. |
 | **Text editors only** | Non-text tabs (diff viewers, webviews, settings UI) are skipped during capture and restore. |
+
+## Feedback and Support
+
+To report bugs, request features, or view the source code, visit the [GitHub repository](https://github.com/Saksham-Mann/vscode-gitrecall).
+
+If GitRecall improves your workflow, please consider leaving a review on the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=Saksham-Mann.gitrecall) and starring the project on [GitHub](https://github.com/Saksham-Mann/vscode-gitrecall). Ongoing feedback helps guide future improvements.
 
 ## License
 

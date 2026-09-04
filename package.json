@@ -2,7 +2,7 @@
   "name": "gitrecall",
   "displayName": "GitRecall: Branch-Aware Workspace & Tab Manager",
   "description": "Automatically restore your tabs, split-pane layout, and cursor positions when switching Git branches. Local-first, zero telemetry, seamless context recovery.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "Saksham-Mann",
   "author": {
     "name": "Saksham Mann",

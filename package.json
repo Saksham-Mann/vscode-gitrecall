@@ -1,0 +1,92 @@
+{
+  "name": "gitrecall",
+  "displayName": "GitRecall: Branch-Aware Workspace & Tab Manager",
+  "description": "Automatically restore your tabs, split-pane layout, and cursor positions when switching Git branches. Local-first, zero telemetry, seamless context recovery.",
+  "version": "1.0.0",
+  "publisher": "Saksham-Mann",
+  "author": {
+    "name": "Saksham Mann",
+    "url": "https://github.com/Saksham-Mann"
+  },
+  "license": "MIT",
+  "icon": "assets/icon.png",
+  "galleryBanner": {
+    "color": "#1e1e2e",
+    "theme": "dark"
+  },
+  "keywords": [
+    "git",
+    "branch",
+    "tabs",
+    "workspace",
+    "restore",
+    "context",
+    "checkout",
+    "switch",
+    "layout",
+    "productivity"
+  ],
+  "categories": [
+    "Other",
+    "SCM Providers",
+    "Programming Languages"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Saksham-Mann/vscode-gitrecall.git"
+  },
+  "homepage": "https://github.com/Saksham-Mann/vscode-gitrecall#readme",
+  "bugs": {
+    "url": "https://github.com/Saksham-Mann/vscode-gitrecall/issues"
+  },
+  "qna": "marketplace",
+  "badges": [
+    {
+      "url": "https://img.shields.io/github/v/release/Saksham-Mann/vscode-gitrecall?color=blue&style=flat-square",
+      "href": "https://github.com/Saksham-Mann/vscode-gitrecall/releases",
+      "description": "Latest Release"
+    },
+    {
+      "url": "https://img.shields.io/badge/license-MIT-green?style=flat-square",
+      "href": "https://github.com/Saksham-Mann/vscode-gitrecall/blob/main/LICENSE",
+      "description": "MIT License"
+    }
+  ],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "gitrecall.showOutput",
+        "title": "GitRecall: Show Output"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "test": "mocha out/test/unit/**/*.test.js out/test/security-resilience.test.js",
+    "test:unit": "mocha --config .mocharc.unit.yml",
+    "test:integration": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.11.24",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^7.1.0",
+    "@typescript-eslint/parser": "^7.1.0",
+    "@vscode/test-cli": "^0.0.4",
+    "@vscode/test-electron": "^2.3.9",
+    "eslint": "^8.57.0",
+    "mocha": "^12.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}

@@ -117,6 +117,7 @@ All guarantees and remediations are verified by the automated test suite in `src
     √ FAIL-SAFE PROOF: closeCleanTabs closes clean tabs even if document is not in workspace.textDocuments
     √ FAIL-SAFE PROOF: Non-text tabs (diffs, webviews, settings) are never closed
     √ [F-02 & F-03 REMEDIATED] Switching to a brand-new branch preserves open tabs and scopes operations to repoRoot
+    √ Switching to an unvisited branch closes tabs for deleted files while preserving existing tabs
     √ BATCH ENFORCEMENT: Exactly cleans clean tabs while preserving all dirty tabs in mixed batch
     √ [VULN-01 PROOF] Catastrophic Storage Wipe: pruneStaleEntries wipes all branches when passed only [prev, curr]
     √ Chained promise lock enforces strict sequential execution
@@ -138,7 +139,7 @@ All guarantees and remediations are verified by the automated test suite in `src
     √ Executes workbench.action.keepEditor on active tab to prevent terminal click demotion
     √ DecorationService.pulseLine on empty line produces zero-width range on safeLine
 
-  60 passing (285ms)
+  61 passing (297ms)
 ```
 
 ---

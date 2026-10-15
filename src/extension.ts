@@ -345,7 +345,8 @@ export async function handleBranchChange(
 
     // ── Step C: Look up incoming branch's saved record ──
     if (!currentBranch) {
-      log('No incoming branch (undefined). Leaving open tabs intact.');
+      log('No incoming branch (undefined). Closing clean tabs for repository.');
+      await closeCleanTabs(undefined, undefined, repoRoot);
       updateStatusBar(currentBranch, false);
       return;
     }
@@ -353,7 +354,14 @@ export async function handleBranchChange(
     const incomingRecord = storage.getBranchContext(repoRoot, currentBranch);
 
     if (!incomingRecord) {
-      log(`No saved record for incoming branch "${currentBranch}". Leaving open tabs intact.`);
+      log(`No saved record for incoming branch "${currentBranch}". Closing tabs that do not exist on disk.`);
+      const statResults = await Promise.allSettled(
+        capturedTabs.map((t) => vscode.workspace.fs.stat(vscode.Uri.parse(t.uri)))
+      );
+      const existingUris = capturedTabs
+        .filter((_, i) => statResults[i].status === 'fulfilled')
+        .map((t) => t.uri);
+      await closeCleanTabs(undefined, existingUris, repoRoot);
       updateStatusBar(currentBranch, false);
       return;
     }

@@ -594,6 +594,44 @@ describe('Security & Resilience Audit Suite', () => {
       decoration.dispose();
     });
 
+    it('Switching to an unvisited branch closes tabs for deleted files while preserving existing tabs', async () => {
+      const repo = '/workspace/repo';
+      const existingUri = 'file:///workspace/repo/surviving.ts';
+      const deletedUri = 'file:///workspace/repo/deleted.ts';
+
+      const existingTab: MockTab = {
+        input: new MockTabInputText(mockVscode.Uri.parse(existingUri)),
+        isDirty: false,
+        isPinned: false
+      };
+      const deletedTab: MockTab = {
+        input: new MockTabInputText(mockVscode.Uri.parse(deletedUri)),
+        isDirty: false,
+        isPinned: false
+      };
+
+      mockState.tabGroupsAll = [{ viewColumn: 1, tabs: [existingTab, deletedTab] }];
+      mockState.statFailUris.add(deletedUri);
+
+      const memento = new InMemoryMemento();
+      const storage = new StorageManager(memento);
+      const decoration = new DecorationService();
+
+      await handleBranchChange(
+        { repoRoot: repo, previousBranch: 'main', currentBranch: 'feature/brand-new' },
+        storage,
+        decoration,
+        () => {}
+      );
+
+      // The deleted file's clean tab must be closed
+      assert.strictEqual(mockState.closedTabs.length, 1, 'Only deleted file tab should be closed');
+      const closedInput = mockState.closedTabs[0].input as MockTabInputText;
+      assert.strictEqual(closedInput.uri.toString(), deletedUri);
+
+      decoration.dispose();
+    });
+
     it('BATCH ENFORCEMENT: Exactly cleans clean tabs while preserving all dirty tabs in mixed batch', async () => {
       const totalTabs = 50;
       const tabs: MockTab[] = [];

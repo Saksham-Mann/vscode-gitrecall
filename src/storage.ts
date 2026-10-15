@@ -1,9 +1,15 @@
 import * as crypto from 'crypto';
+import { logWarn } from './logger';
 
 /**
  * Current schema version for BranchContextRecord and storage key namespacing.
  */
 export const CURRENT_SCHEMA_VERSION = 1;
+
+/**
+ * Maximum number of tab records allowed in a single BranchContextRecord to prevent DoS.
+ */
+export const MAX_TABS_PER_BRANCH = 200;
 
 /**
  * Zero-based line and character cursor position, matching vscode.Position semantics.
@@ -67,7 +73,7 @@ export interface BranchWorkspaceMap {
 
 /**
  * Index record tracking all known sanitized branch keys for a repository.
- * Stored under the key: gitrecall.v{schemaVersion}.{repoRootHash}.__index
+ * Stored under the key: gitrecall.v{schemaVersion}.{repoRootHash}.meta.__index
  */
 export interface BranchIndexRecord {
   schemaVersion: number;
@@ -124,8 +130,14 @@ export function isTabRecord(value: unknown): value is TabRecord {
   }
   return (
     typeof value.uri === 'string' &&
+    value.uri.length > 0 &&
     typeof value.viewColumn === 'number' &&
+    Number.isInteger(value.viewColumn) &&
+    value.viewColumn >= 1 &&
+    value.viewColumn <= 9 &&
     typeof value.tabIndex === 'number' &&
+    Number.isInteger(value.tabIndex) &&
+    value.tabIndex >= 0 &&
     typeof value.isPinned === 'boolean' &&
     isCursorPosition(value.cursor)
   );
@@ -142,12 +154,16 @@ export function isBranchContextRecord(value: unknown): value is BranchContextRec
 
   return (
     typeof value.schemaVersion === 'number' &&
+    Number.isInteger(value.schemaVersion) &&
     typeof value.repoRoot === 'string' &&
+    value.repoRoot.length > 0 &&
     typeof value.branch === 'string' &&
+    value.branch.length > 0 &&
     typeof value.savedAt === 'string' &&
     (value.activeTabUri === null || typeof value.activeTabUri === 'string') &&
     hasValidActiveCursor &&
     Array.isArray(value.tabs) &&
+    value.tabs.length <= MAX_TABS_PER_BRANCH &&
     value.tabs.every(isTabRecord)
   );
 }
@@ -158,19 +174,28 @@ export function isBranchIndexRecord(value: unknown): value is BranchIndexRecord 
   }
   return (
     typeof value.schemaVersion === 'number' &&
+    Number.isInteger(value.schemaVersion) &&
     typeof value.repoRoot === 'string' &&
     Array.isArray(value.knownBranchKeys) &&
-    value.knownBranchKeys.every(k => typeof k === 'string')
+    value.knownBranchKeys.every((k) => typeof k === 'string')
   );
 }
 
 // Key construction & sanitization helpers
 
 /**
- * Normalizes repository root path across platforms (forward slashes, no trailing slash, lowercased).
+ * Normalizes repository root path across platforms (forward slashes, no trailing slash).
+ * Folds case on Windows or for Windows drive paths while preserving case on case-sensitive POSIX platforms.
  */
-export function normalizeRepoRoot(repoRoot: string): string {
-  return repoRoot.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+export function normalizeRepoRoot(
+  repoRoot: string,
+  platform: NodeJS.Platform = process.platform
+): string {
+  const forward = repoRoot.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  if (/^[a-zA-Z]:(\/|$)/.test(forward) || platform === 'win32') {
+    return forward.toLowerCase();
+  }
+  return forward;
 }
 
 /**
@@ -182,15 +207,15 @@ export function hashRepoRoot(repoRoot: string): string {
 }
 
 /**
- * Sanitizes Git branch names safely by stripping null/control characters and encoding slashes.
- * Uses an unambiguous escape scheme to prevent cross-branch collisions.
+ * Sanitizes Git branch names safely using a strictly bijective, prefix-free escape grammar.
+ * Escapes '_' -> '_u_', '/' -> '_s_', and control bytes [\x00-\x1F\x7F] -> '_xNN_'.
  */
 export function sanitizeBranchName(branch: string): string {
-  // eslint-disable-next-line no-control-regex
-  const clean = branch.replace(/[\x00-\x1F\x7F]/g, '');
-  // Escape underscores first, then encode slashes to prevent collision
-  // e.g. "a/b" -> "a_s_b", "a__b" -> "a_u__u_b"
-  return clean.replace(/_/g, '_u_').replace(/\//g, '_s_');
+  return branch
+    .replace(/_/g, '_u_')
+    .replace(/\//g, '_s_')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x1F\x7F]/g, (ch) => `_x${ch.charCodeAt(0).toString(16).padStart(2, '0')}_`);
 }
 
 /**
@@ -245,7 +270,7 @@ export class StorageManager {
     try {
       raw = this.memento.get<unknown>(key);
     } catch (error) {
-      console.warn(`[GitRecall] Error reading branch context for "${branch}" from storage:`, error);
+      logWarn(`Error reading branch context for "${branch}" from storage`, error);
       return undefined;
     }
 
@@ -255,15 +280,25 @@ export class StorageManager {
 
     if (isRecord(raw) && typeof raw.schemaVersion === 'number') {
       if (raw.schemaVersion !== CURRENT_SCHEMA_VERSION) {
-        console.warn(
-          `[GitRecall] Schema version mismatch for branch "${branch}". Expected ${CURRENT_SCHEMA_VERSION}, got ${raw.schemaVersion}. Treating as absent.`
+        logWarn(
+          `Schema version mismatch for branch "${branch}". Expected ${CURRENT_SCHEMA_VERSION}, got ${raw.schemaVersion}. Treating as absent.`
         );
         return undefined;
       }
     }
 
     if (!isBranchContextRecord(raw)) {
-      console.warn(`[GitRecall] Invalid record shape retrieved for branch "${branch}". Treating as absent.`);
+      logWarn(`Invalid record shape retrieved for branch "${branch}". Treating as absent.`);
+      return undefined;
+    }
+
+    if (
+      normalizeRepoRoot(raw.repoRoot) !== normalizeRepoRoot(repoRoot) ||
+      raw.branch !== branch
+    ) {
+      logWarn(
+        `Record identity mismatch for branch "${branch}" in repo "${repoRoot}". Treating as absent.`
+      );
       return undefined;
     }
 
@@ -272,6 +307,7 @@ export class StorageManager {
 
   /**
    * Persists a BranchContextRecord and updates the repository's branch index.
+   * Updates the index before writing the branch record so no persisted branch record is orphaned.
    */
   async saveBranchContext(
     repoRoot: string,
@@ -284,14 +320,7 @@ export class StorageManager {
 
     const key = buildBranchKey(repoRoot, branch);
 
-    try {
-      await this.memento.update(key, record);
-    } catch (error) {
-      console.warn(`[GitRecall] Failed to persist branch context for "${branch}":`, error);
-      throw new StoragePersistError(`Failed to persist branch context for "${branch}"`, error);
-    }
-
-    // Maintain index for prune operations
+    // Maintain index first so any persisted branch record is guaranteed to be tracked
     try {
       const sanitizedBranch = sanitizeBranchName(branch);
       const indexKey = buildIndexKey(repoRoot);
@@ -306,8 +335,15 @@ export class StorageManager {
         await this.memento.update(indexKey, updatedIndex);
       }
     } catch (error) {
-      console.warn(`[GitRecall] Failed to update branch index for repo "${repoRoot}":`, error);
+      logWarn(`Failed to update branch index for repo "${repoRoot}"`, error);
       throw new StoragePersistError(`Failed to update branch index for repo "${repoRoot}"`, error);
+    }
+
+    try {
+      await this.memento.update(key, record);
+    } catch (error) {
+      logWarn(`Failed to persist branch context for "${branch}"`, error);
+      throw new StoragePersistError(`Failed to persist branch context for "${branch}"`, error);
     }
   }
 
@@ -320,7 +356,7 @@ export class StorageManager {
     try {
       await this.memento.update(key, undefined);
     } catch (error) {
-      console.warn(`[GitRecall] Failed to delete branch context for "${branch}":`, error);
+      logWarn(`Failed to delete branch context for "${branch}"`, error);
       throw new StoragePersistError(`Failed to delete branch context for "${branch}"`, error);
     }
 
@@ -333,12 +369,12 @@ export class StorageManager {
         const updatedIndex: BranchIndexRecord = {
           schemaVersion: CURRENT_SCHEMA_VERSION,
           repoRoot,
-          knownBranchKeys: currentIndex.knownBranchKeys.filter(k => k !== sanitizedBranch)
+          knownBranchKeys: currentIndex.knownBranchKeys.filter((k) => k !== sanitizedBranch)
         };
         await this.memento.update(indexKey, updatedIndex);
       }
     } catch (error) {
-      console.warn(`[GitRecall] Failed to update branch index during deletion for repo "${repoRoot}":`, error);
+      logWarn(`Failed to update branch index during deletion for repo "${repoRoot}"`, error);
       throw new StoragePersistError(`Failed to update branch index during deletion`, error);
     }
   }
@@ -348,9 +384,9 @@ export class StorageManager {
    */
   async pruneStaleEntries(repoRoot: string, currentValidBranches: string[]): Promise<void> {
     const currentIndex = this.getIndexRecord(repoRoot);
-    const validSanitizedKeys = new Set(currentValidBranches.map(b => sanitizeBranchName(b)));
+    const validSanitizedKeys = new Set(currentValidBranches.map((b) => sanitizeBranchName(b)));
 
-    const staleKeys = currentIndex.knownBranchKeys.filter(k => !validSanitizedKeys.has(k));
+    const staleKeys = currentIndex.knownBranchKeys.filter((k) => !validSanitizedKeys.has(k));
     if (staleKeys.length === 0) {
       return;
     }
@@ -360,12 +396,12 @@ export class StorageManager {
       try {
         await this.memento.update(key, undefined);
       } catch (error) {
-        console.warn(`[GitRecall] Failed to prune stale branch record "${staleKey}":`, error);
+        logWarn(`Failed to prune stale branch record "${staleKey}"`, error);
         throw new StoragePersistError(`Failed to prune stale branch record "${staleKey}"`, error);
       }
     }
 
-    const remainingKeys = currentIndex.knownBranchKeys.filter(k => validSanitizedKeys.has(k));
+    const remainingKeys = currentIndex.knownBranchKeys.filter((k) => validSanitizedKeys.has(k));
     const updatedIndex: BranchIndexRecord = {
       schemaVersion: CURRENT_SCHEMA_VERSION,
       repoRoot,
@@ -375,7 +411,7 @@ export class StorageManager {
     try {
       await this.memento.update(buildIndexKey(repoRoot), updatedIndex);
     } catch (error) {
-      console.warn(`[GitRecall] Failed to update branch index after pruning for repo "${repoRoot}":`, error);
+      logWarn(`Failed to update branch index after pruning for repo "${repoRoot}"`, error);
       throw new StoragePersistError(`Failed to update branch index after pruning`, error);
     }
   }
@@ -387,11 +423,15 @@ export class StorageManager {
     const indexKey = buildIndexKey(repoRoot);
     try {
       const raw = this.memento.get<unknown>(indexKey);
-      if (isBranchIndexRecord(raw) && raw.schemaVersion === CURRENT_SCHEMA_VERSION) {
+      if (
+        isBranchIndexRecord(raw) &&
+        raw.schemaVersion === CURRENT_SCHEMA_VERSION &&
+        normalizeRepoRoot(raw.repoRoot) === normalizeRepoRoot(repoRoot)
+      ) {
         return raw;
       }
     } catch (error) {
-      console.warn(`[GitRecall] Failed to read branch index for repo "${repoRoot}":`, error);
+      logWarn(`Failed to read branch index for repo "${repoRoot}"`, error);
     }
 
     return {

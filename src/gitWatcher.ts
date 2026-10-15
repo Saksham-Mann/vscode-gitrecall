@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
 import { GitExtension, Repository } from './gitApiTypes';
+import { normalizeRepoRoot } from './storage';
+import { logWarn } from './logger';
 
 /**
  * Event fired when an active Git repository transitions to a different branch or commit.
@@ -9,15 +11,19 @@ export interface BranchChangeEvent {
   repoRoot: string;
   /** The branch name before the transition, or undefined if previously detached/uninitialized. */
   previousBranch: string | undefined;
-  /** The newly checked-out branch name, or a synthetic detached HEAD key (`detached__<sha>`). */
+  /** The newly checked-out branch name, or a synthetic detached HEAD key (`detached:<sha>`). */
   currentBranch: string | undefined;
 }
 
 /**
  * Normalizes repository filesystem path for consistent internal map lookups.
+ * Preserves case on case-sensitive POSIX platforms while folding case on Windows.
  */
-export function normalizeRepoPath(path: string): string {
-  return path.trim().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+export function normalizeRepoPath(
+  path: string,
+  platform: NodeJS.Platform = process.platform
+): string {
+  return normalizeRepoRoot(path, platform);
 }
 
 /**
@@ -50,7 +56,7 @@ export class GitWatcher implements vscode.Disposable {
     try {
       const gitExtension = vscode.extensions.getExtension<GitExtension>('vscode.git');
       if (!gitExtension) {
-        console.warn('[GitRecall] Built-in Git extension (vscode.git) not found or disabled.');
+        logWarn('Built-in Git extension (vscode.git) not found or disabled.');
         return false;
       }
 
@@ -60,7 +66,7 @@ export class GitWatcher implements vscode.Disposable {
 
       const gitApi = gitExtension.exports?.getAPI(1);
       if (!gitApi) {
-        console.warn('[GitRecall] Failed to obtain Git API (version 1) from vscode.git.');
+        logWarn('Failed to obtain Git API (version 1) from vscode.git.');
         return false;
       }
 
@@ -70,7 +76,7 @@ export class GitWatcher implements vscode.Disposable {
           try {
             this.setupRepository(repository);
           } catch (error) {
-            console.warn('[GitRecall] Error handling opened repository:', error);
+            logWarn('Error handling opened repository', error);
           }
         })
       );
@@ -81,7 +87,7 @@ export class GitWatcher implements vscode.Disposable {
           try {
             this.teardownRepository(repository);
           } catch (error) {
-            console.warn('[GitRecall] Error handling closed repository:', error);
+            logWarn('Error handling closed repository', error);
           }
         })
       );
@@ -91,14 +97,14 @@ export class GitWatcher implements vscode.Disposable {
         try {
           this.setupRepository(repository);
         } catch (error) {
-          console.warn('[GitRecall] Error setting up initial repository:', error);
+          logWarn('Error setting up initial repository', error);
         }
       }
 
       this.isActivated = true;
       return true;
     } catch (error) {
-      console.warn('[GitRecall] Exception occurred during GitWatcher activation:', error);
+      logWarn('Exception occurred during GitWatcher activation', error);
       return false;
     }
   }
@@ -149,6 +155,8 @@ export class GitWatcher implements vscode.Disposable {
 
   /**
    * Resolves the current branch name or synthetic detached-HEAD key for a repository.
+   * Uses ':' in synthetic detached keys because ':' is forbidden in Git branch names
+   * by git-check-ref-format, eliminating collisions with branches named `detached__<sha>`.
    */
   private resolveBranch(repository: Repository): string | undefined {
     const head = repository.state?.HEAD;
@@ -161,7 +169,7 @@ export class GitWatcher implements vscode.Disposable {
     }
 
     if (head.commit) {
-      return `detached__${head.commit.slice(0, 7)}`;
+      return `detached:${head.commit.slice(0, 7)}`;
     }
 
     return undefined;
@@ -186,7 +194,7 @@ export class GitWatcher implements vscode.Disposable {
       try {
         this.handleRepositoryStateChange(repository);
       } catch (error) {
-        console.warn(`[GitRecall] Error in state.onDidChange for "${repoRoot}":`, error);
+        logWarn(`Error in state.onDidChange for "${repoRoot}"`, error);
       }
     });
 
@@ -283,7 +291,7 @@ export class GitWatcher implements vscode.Disposable {
         });
       }
     } catch (error) {
-      console.warn('[GitRecall] Error processing debounced branch change:', error);
+      logWarn('Error processing debounced branch change', error);
     }
   }
 }

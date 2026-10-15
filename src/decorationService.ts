@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { clamp } from './tabManager';
+import { logWarn } from './logger';
 
 /**
  * Service managing ephemeral pulse decorations on restored cursor lines.
@@ -75,13 +76,13 @@ export class DecorationService implements vscode.Disposable {
           editor.setDecorations(this.decorationType, []);
         } catch (err) {
           // Editor might have been disposed before callback ran
-          console.warn('[GitRecall] Error removing line pulse decoration:', err);
+          logWarn('Error removing line pulse decoration', err);
         }
       }, 1500);
 
       this.activeTimers.set(editor, timer);
     } catch (error) {
-      console.warn('[GitRecall] Failed to apply line pulse decoration:', error);
+      logWarn('Failed to apply line pulse decoration', error);
     }
   }
 

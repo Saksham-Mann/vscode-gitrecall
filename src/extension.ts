@@ -1,8 +1,9 @@
 import * as vscode from 'vscode';
 import { StorageManager, StoragePersistError, BranchContextRecord, CursorPosition, CURRENT_SCHEMA_VERSION } from './storage';
 import { GitWatcher, BranchChangeEvent } from './gitWatcher';
-import { captureCurrentState, closeCleanTabs, restoreTabs, areUrisEqual } from './tabManager';
+import { captureCurrentState, closeCleanTabs, restoreTabs, areUrisEqual, isSafeLocalFileUri } from './tabManager';
 import { DecorationService } from './decorationService';
+import { log, logWarn, setOutputChannel } from './logger';
 
 /** Shared OutputChannel for all GitRecall diagnostics. */
 let outputChannel: vscode.OutputChannel | undefined;
@@ -24,21 +25,17 @@ export interface ActiveCursorCache {
 export let lastKnownActiveCursor: ActiveCursorCache | null = null;
 
 /**
- * Logs a message to the GitRecall OutputChannel and to the dev console.
+ * Sanitizes a branch name for safe display in the VS Code status bar and dialogs.
+ * Strips control characters, escapes `$(...)` codicon tokens to prevent UI spoofing,
+ * and truncates excessively long names.
  */
-function log(message: string): void {
-  const timestamped = `[${new Date().toISOString()}] ${message}`;
-  outputChannel?.appendLine(timestamped);
-  console.log(`[GitRecall] ${message}`);
-}
-
-/**
- * Logs a warning to the GitRecall OutputChannel and to the dev console.
- */
-function logWarn(message: string): void {
-  const timestamped = `[${new Date().toISOString()}] WARN: ${message}`;
-  outputChannel?.appendLine(timestamped);
-  console.warn(`[GitRecall] ${message}`);
+export function formatBranchForDisplay(branch: string, maxLength: number = 60): string {
+  // eslint-disable-next-line no-control-regex
+  const clean = branch.replace(/[\x00-\x1F\x7F]/g, '').replace(/\$\(/g, '\\$(');
+  if (clean.length > maxLength) {
+    return `${clean.slice(0, maxLength)}…`;
+  }
+  return clean;
 }
 
 /**
@@ -50,6 +47,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   try {
     // --- OutputChannel ---
     outputChannel = vscode.window.createOutputChannel('GitRecall');
+    setOutputChannel(outputChannel);
     context.subscriptions.push(outputChannel);
     log('Activating GitRecall...');
 
@@ -94,21 +92,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!branch) {
         statusBarItem.text = '$(history) GitRecall';
         statusBarItem.tooltip = 'GitRecall is active but no branch is checked out';
-      } else if (hasSavedRecord) {
-        statusBarItem.text = `$(history) GitRecall: ${branch}`;
-        statusBarItem.tooltip = `GitRecall is tracking tabs & cursor position for '${branch}'`;
       } else {
-        statusBarItem.text = `$(history) GitRecall: new`;
-        statusBarItem.tooltip = `GitRecall is active on '${branch}' (no saved state yet)`;
+        const safeBranch = formatBranchForDisplay(branch);
+        if (hasSavedRecord) {
+          statusBarItem.text = `$(history) GitRecall: ${safeBranch}`;
+          statusBarItem.tooltip = `GitRecall is tracking tabs & cursor position for '${safeBranch}'`;
+        } else {
+          statusBarItem.text = `$(history) GitRecall: new`;
+          statusBarItem.tooltip = `GitRecall is active on '${safeBranch}' (no saved state yet)`;
+        }
       }
       statusBarItem.show();
     };
 
     // Initialize the status bar with whatever branch is currently checked out.
-    // We pick the first repository's branch if there is one — multi-repo is out-of-scope for v1.
     {
       const allGroups = vscode.window.tabGroups.all;
-      // Use the first repo root we can find from the watcher
       let initialBranch: string | undefined;
       let initialRepoRoot: string | undefined;
 
@@ -131,7 +130,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         updateStatusBar(undefined, false);
       }
 
-      // Suppress unused-variable lint for allGroups — referenced to ensure tabGroups API is available
       void allGroups;
     }
 
@@ -139,7 +137,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Maintain real-time selection cache so terminal focus or blur does not lose active cursor
     const selectionSubscription = vscode.window.onDidChangeTextEditorSelection((e) => {
       try {
-        if (!e.textEditor || e.textEditor.document.uri.scheme !== 'file') {
+        if (
+          !e.textEditor ||
+          !isSafeLocalFileUri(e.textEditor.document.uri.toString(), e.textEditor.document.uri)
+        ) {
           return;
         }
         // Only record user-initiated selections (keyboard, mouse, command).
@@ -155,15 +156,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             character: selection.active.character
           };
         }
-      } catch {
-        // Ignore selection tracking errors
+      } catch (err) {
+        logWarn('Ignored selection tracking error', err);
       }
     });
     context.subscriptions.push(selectionSubscription);
 
     const activeEditorSubscription = vscode.window.onDidChangeActiveTextEditor((editor) => {
       try {
-        if (!editor || editor.document.uri.scheme !== 'file') {
+        if (
+          !editor ||
+          !isSafeLocalFileUri(editor.document.uri.toString(), editor.document.uri)
+        ) {
           return;
         }
         const selection = editor.selection;
@@ -174,11 +178,34 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             character: selection.active.character
           };
         }
-      } catch {
-        // Ignore active editor change tracking errors
+      } catch (err) {
+        logWarn('Ignored active editor change tracking error', err);
       }
     });
     context.subscriptions.push(activeEditorSubscription);
+
+    // Clear lastKnownActiveCursor if its tab is closed by the user
+    if (typeof vscode.window.tabGroups?.onDidChangeTabs === 'function') {
+      const tabCloseSubscription = vscode.window.tabGroups.onDidChangeTabs((e) => {
+        try {
+          if (!lastKnownActiveCursor) {
+            return;
+          }
+          for (const closedTab of e.closed) {
+            if (
+              closedTab.input instanceof vscode.TabInputText &&
+              areUrisEqual(closedTab.input.uri.toString(), lastKnownActiveCursor.uri)
+            ) {
+              lastKnownActiveCursor = null;
+              break;
+            }
+          }
+        } catch (err) {
+          logWarn('Error handling tab close event for cursor cache', err);
+        }
+      });
+      context.subscriptions.push(tabCloseSubscription);
+    }
 
     // --- Concurrency Lock ---
     // A simple chained-promise lock ensuring save/restore cycles run strictly sequentially.
@@ -189,13 +216,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // Chain onto the existing cycle so overlapping events serialize
       cycleChain = cycleChain
         .then(() => handleBranchChange(event, storage, decorationService!, updateStatusBar))
-        .catch((err) => logWarn(`Critical error in branch change chain: ${String(err)}`));
+        .catch((err) => logWarn('Critical error in branch change chain', err));
     });
     context.subscriptions.push(branchChangeSubscription);
 
     log('GitRecall activated successfully.');
   } catch (error) {
-    logWarn(`Unexpected error during activation: ${String(error)}`);
+    logWarn('Unexpected error during activation', error);
   }
 }
 
@@ -203,7 +230,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
  * Executes the full branch-switch cycle: save → clean desk → restore → pulse.
  * Runs inside the concurrency lock so cycles never overlap.
  */
-async function handleBranchChange(
+export async function handleBranchChange(
   event: BranchChangeEvent,
   storage: StorageManager,
   decoration: DecorationService,
@@ -227,92 +254,98 @@ async function handleBranchChange(
       return;
     }
 
-    // ── Step A: Capture outgoing branch's tab state ──
-    const capturedTabs = captureCurrentState(lastKnownActiveCursor);
+    // ── Step A: Capture outgoing branch's tab state (scoped to repoRoot) ──
+    const capturedTabs = captureCurrentState(lastKnownActiveCursor, repoRoot);
     log(`Captured ${capturedTabs.length} tab(s) for outgoing branch "${previousBranch}".`);
 
-      // Determine active tab URI and cursor coordinates
-      let activeTabUri: string | null = null;
-      try {
-        const activeTab = vscode.window.tabGroups.activeTabGroup?.activeTab;
-        if (activeTab?.input instanceof vscode.TabInputText) {
-          activeTabUri = activeTab.input.uri.toString();
-        } else if (!activeTabUri && lastKnownActiveCursor) {
-          activeTabUri = lastKnownActiveCursor.uri;
-        }
-      } catch (err) {
-        logWarn(`Could not determine active tab URI: ${String(err)}`);
-      }
+    // Only trust lastKnownActiveCursor if its URI is still among the open captured tabs for this repo
+    const validCachedCursor =
+      lastKnownActiveCursor &&
+      capturedTabs.some((t) => areUrisEqual(t.uri, lastKnownActiveCursor!.uri))
+        ? lastKnownActiveCursor
+        : null;
 
-      let activeCursor: CursorPosition | null = null;
-      try {
-        // Prioritize lastKnownActiveCursor if it matches activeTabUri (via areUrisEqual).
-        // When a branch change event fires, Git has already modified files on disk and VS Code
-        // may have reloaded editors with shifted lines. lastKnownActiveCursor captures the user's
-        // authentic cursor before the checkout.
-        if (
-          lastKnownActiveCursor &&
-          (!activeTabUri || areUrisEqual(lastKnownActiveCursor.uri, activeTabUri))
-        ) {
+    // Determine active tab URI and cursor coordinates
+    let activeTabUri: string | null = null;
+    try {
+      const activeTab = vscode.window.tabGroups.activeTabGroup?.activeTab;
+      if (
+        activeTab?.input instanceof vscode.TabInputText &&
+        isSafeLocalFileUri(activeTab.input.uri.toString(), activeTab.input.uri, repoRoot)
+      ) {
+        activeTabUri = activeTab.input.uri.toString();
+      } else if (!activeTabUri && validCachedCursor) {
+        activeTabUri = validCachedCursor.uri;
+      }
+    } catch (err) {
+      logWarn('Could not determine active tab URI', err);
+    }
+
+    let activeCursor: CursorPosition | null = null;
+    try {
+      if (
+        validCachedCursor &&
+        (!activeTabUri || areUrisEqual(validCachedCursor.uri, activeTabUri))
+      ) {
+        activeCursor = {
+          line: validCachedCursor.line,
+          character: validCachedCursor.character
+        };
+        if (!activeTabUri) {
+          activeTabUri = validCachedCursor.uri;
+        }
+      } else {
+        const activeEditor = vscode.window.activeTextEditor;
+        if (activeEditor && activeTabUri && areUrisEqual(activeEditor.document.uri.toString(), activeTabUri)) {
           activeCursor = {
-            line: lastKnownActiveCursor.line,
-            character: lastKnownActiveCursor.character
+            line: activeEditor.selection.active.line,
+            character: activeEditor.selection.active.character
           };
-          if (!activeTabUri) {
-            activeTabUri = lastKnownActiveCursor.uri;
-          }
-        } else {
-          const activeEditor = vscode.window.activeTextEditor;
-          if (activeEditor && activeTabUri && areUrisEqual(activeEditor.document.uri.toString(), activeTabUri)) {
+        } else if (activeTabUri) {
+          const matchingTab = capturedTabs.find((t) => areUrisEqual(t.uri, activeTabUri));
+          if (matchingTab) {
             activeCursor = {
-              line: activeEditor.selection.active.line,
-              character: activeEditor.selection.active.character
+              line: matchingTab.cursor.line,
+              character: matchingTab.cursor.character
             };
-          } else if (activeTabUri) {
-            const matchingTab = capturedTabs.find((t) => areUrisEqual(t.uri, activeTabUri));
-            if (matchingTab) {
-              activeCursor = {
-                line: matchingTab.cursor.line,
-                character: matchingTab.cursor.character
-              };
-            }
           }
         }
-      } catch (err) {
-        logWarn(`Could not determine active cursor coordinates: ${String(err)}`);
       }
+    } catch (err) {
+      logWarn('Could not determine active cursor coordinates', err);
+    }
 
-      const record: BranchContextRecord = {
-        schemaVersion: CURRENT_SCHEMA_VERSION,
-        repoRoot,
-        branch: previousBranch,
-        savedAt: new Date().toISOString(),
-        activeTabUri,
-        activeCursor,
-        tabs: capturedTabs
-      };
+    const record: BranchContextRecord = {
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      repoRoot,
+      branch: previousBranch,
+      savedAt: new Date().toISOString(),
+      activeTabUri,
+      activeCursor,
+      tabs: capturedTabs
+    };
 
-      // ── Step B: Persist ──
-      try {
-        await storage.saveBranchContext(repoRoot, previousBranch, record);
-        log(`Saved context for branch "${previousBranch}".`);
-      } catch (error) {
-        if (error instanceof StoragePersistError) {
-          logWarn(`Persistence failure for branch "${previousBranch}": ${error.message}`);
-          // Single approved user-facing warning per docs/ARCHITECTURE.md §5
-          vscode.window.showWarningMessage(
-            `GitRecall: Failed to save editor context for branch "${previousBranch}". Your tabs and cursor positions for that branch may not be restored next time.`
-          );
-        } else {
-          logWarn(`Unexpected save error for branch "${previousBranch}": ${String(error)}`);
-        }
-        // Continue — restoration of the incoming branch should still proceed
+    // ── Step B: Persist ──
+    try {
+      await storage.saveBranchContext(repoRoot, previousBranch, record);
+      log(`Saved context for branch "${previousBranch}".`);
+    } catch (error) {
+      const safePrev = formatBranchForDisplay(previousBranch);
+      if (error instanceof StoragePersistError) {
+        logWarn(`Persistence failure for branch "${previousBranch}"`, error);
+        // Single approved user-facing warning per docs/ARCHITECTURE.md §5
+        vscode.window.showWarningMessage(
+          `GitRecall: Failed to save editor context for branch "${safePrev}". Your tabs and cursor positions for that branch may not be restored next time.`
+        );
+      } else {
+        logWarn(`Unexpected save error for branch "${previousBranch}"`, error);
       }
+      // Continue — restoration of the incoming branch should still proceed
+    }
 
     // ── Step C: Look up incoming branch's saved record ──
     if (!currentBranch) {
-      log('No incoming branch (undefined). Skipping restoration.');
-      await closeCleanTabs();
+      log('No incoming branch (undefined). Leaving open tabs intact.');
       updateStatusBar(currentBranch, false);
       return;
     }
@@ -320,18 +353,14 @@ async function handleBranchChange(
     const incomingRecord = storage.getBranchContext(repoRoot, currentBranch);
 
     if (!incomingRecord) {
-      log(`No saved record for incoming branch "${currentBranch}". Skipping restoration.`);
-      await closeCleanTabs();
+      log(`No saved record for incoming branch "${currentBranch}". Leaving open tabs intact.`);
       updateStatusBar(currentBranch, false);
       return;
     }
 
-    // ── Step D: Clean Desk with diff-based preservation ──
-    // Preserve tabs that belong to the incoming branch.
-    // Only close clean tabs that are NOT needed on the incoming branch.
-    // This completely eliminates blank-screen flashing, redraw churn, and UI glitches.
+    // ── Step D: Clean Desk with diff-based preservation (scoped to repoRoot) ──
     const incomingUris = incomingRecord.tabs.map((t) => t.uri);
-    await closeCleanTabs(undefined, incomingUris);
+    await closeCleanTabs(undefined, incomingUris, repoRoot);
     log('Clean Desk complete.');
 
     // ── Step E: Restore tabs + pulse ──
@@ -342,14 +371,31 @@ async function handleBranchChange(
         decoration.pulseLine(editor, line);
       },
       incomingRecord.activeTabUri,
-      incomingRecord.activeCursor
+      incomingRecord.activeCursor,
+      repoRoot
     );
+
+    // Synchronize lastKnownActiveCursor with the restored branch state
+    if (incomingRecord.activeTabUri) {
+      const fallbackTab = incomingRecord.tabs.find((t) =>
+        areUrisEqual(t.uri, incomingRecord.activeTabUri)
+      );
+      const restoredCursor = incomingRecord.activeCursor ?? fallbackTab?.cursor ?? { line: 0, character: 0 };
+      lastKnownActiveCursor = {
+        uri: incomingRecord.activeTabUri,
+        line: restoredCursor.line,
+        character: restoredCursor.character
+      };
+    } else {
+      lastKnownActiveCursor = null;
+    }
+
     log(`Restoration complete for branch "${currentBranch}".`);
 
     // ── Step F: Update status bar ──
     updateStatusBar(currentBranch, true);
   } catch (error) {
-    logWarn(`Unhandled error in branch-change cycle: ${String(error)}`);
+    logWarn('Unhandled error in branch-change cycle', error);
     // Do not rethrow — the promise chain must never reject unhandled
   }
 }
@@ -364,17 +410,18 @@ export function deactivate(): void {
     gitWatcher?.dispose();
     gitWatcher = undefined;
   } catch (error) {
-    console.warn('[GitRecall] Error disposing GitWatcher during deactivation:', error);
+    logWarn('Error disposing GitWatcher during deactivation', error);
   }
 
   try {
     decorationService?.dispose();
     decorationService = undefined;
   } catch (error) {
-    console.warn('[GitRecall] Error disposing DecorationService during deactivation:', error);
+    logWarn('Error disposing DecorationService during deactivation', error);
   }
 
   try {
+    setOutputChannel(undefined);
     outputChannel?.dispose();
     outputChannel = undefined;
   } catch (error) {

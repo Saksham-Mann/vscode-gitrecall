@@ -15,7 +15,7 @@ interface MockTab {
 }
 
 interface MockTextDocument {
-  uri: { toString(): string; fsPath: string; scheme: string };
+  uri: { toString(): string; fsPath: string; scheme: string; authority?: string };
   isDirty: boolean;
   lineCount: number;
   lineAt(line: number): { text: string; range: unknown };
@@ -31,18 +31,19 @@ interface MockTextEditor {
 }
 
 const mockState = {
-  tabGroupsAll: [] as Array<{ viewColumn?: number; tabs: MockTab[] }>,
+  tabGroupsAll: [] as Array<{ viewColumn?: number; tabs: MockTab[]; activeTab?: MockTab }>,
   textDocuments: [] as MockTextDocument[],
   visibleTextEditors: [] as MockTextEditor[],
   activeTextEditor: undefined as MockTextEditor | undefined,
   closedTabs: [] as MockTab[],
   statFailUris: new Set<string>(),
+  statCalledUris: [] as string[],
   editorsShown: [] as Array<{ uri: unknown; options?: unknown }>,
   commandsExecuted: [] as Array<{ command: string; args: unknown[] }>,
 };
 
 class MockTabInputText {
-  constructor(public readonly uri: { toString(): string; fsPath: string; scheme: string }) {}
+  constructor(public readonly uri: { toString(): string; fsPath: string; scheme: string; authority?: string }) {}
 }
 
 class MockPosition {
@@ -103,11 +104,17 @@ const mockVscode = {
   Uri: {
     parse: (uriStr: string) => {
       const scheme = uriStr.includes(':') ? uriStr.split(':')[0] : 'file';
+      let authority = '';
+      if (uriStr.startsWith('file:////')) {
+        authority = uriStr.split('/')[4] || '';
+      } else if (/^file:\/\/(?!\/)/i.test(uriStr)) {
+        authority = uriStr.slice('file://'.length).split('/')[0] || '';
+      }
       return {
         toString: () => uriStr,
-        fsPath: uriStr.replace(/^[a-z]+:\/\//, ''),
+        fsPath: uriStr.replace(/^[a-z]+:\/\//i, ''),
         scheme,
-        authority: uriStr.startsWith('file:////') ? uriStr.split('/')[4] || '' : ''
+        authority
       };
     },
     file: (fsPath: string) => ({
@@ -122,6 +129,9 @@ const mockVscode = {
       get all() {
         return mockState.tabGroupsAll;
       },
+      get activeTabGroup() {
+        return mockState.tabGroupsAll[0];
+      },
       close: async (tabs: MockTab[], _preserveFocus?: boolean) => {
         mockState.closedTabs.push(...tabs);
         return true;
@@ -133,12 +143,13 @@ const mockVscode = {
     get activeTextEditor() {
       return mockState.activeTextEditor;
     },
+    showWarningMessage: async (_msg: string) => undefined,
     showTextDocument: async (uri: unknown, options?: unknown) => {
       mockState.editorsShown.push({ uri, options });
       const uriStr = typeof uri === 'object' && uri && 'toString' in uri ? (uri as { toString(): string }).toString() : String(uri);
       const editor: MockTextEditor = {
         document: {
-          uri: { toString: () => uriStr, fsPath: uriStr, scheme: 'file' },
+          uri: { toString: () => uriStr, fsPath: uriStr, scheme: 'file', authority: '' },
           isDirty: false,
           lineCount: 10,
           lineAt: (line: number) => {
@@ -171,6 +182,7 @@ const mockVscode = {
     },
     fs: {
       stat: async (uri: { toString(): string }) => {
+        mockState.statCalledUris.push(uri.toString());
         if (mockState.statFailUris.has(uri.toString())) {
           throw new Error('FileNotFound');
         }
@@ -194,18 +206,30 @@ Module.prototype.require = function (id: string, ...args: unknown[]) {
 import {
   StorageManager,
   CURRENT_SCHEMA_VERSION,
+  MAX_TABS_PER_BRANCH,
   BranchContextRecord,
   MementoLike,
   buildBranchKey,
   buildIndexKey,
   sanitizeBranchName,
+  normalizeRepoRoot,
   isCursorPosition,
   isTabRecord,
   isBranchContextRecord,
   isBranchIndexRecord
 } from '../storage';
 
-import { closeCleanTabs, restoreTabs, captureCurrentState, applyCursorAndDecoration } from '../tabManager';
+import {
+  closeCleanTabs,
+  restoreTabs,
+  captureCurrentState,
+  applyCursorAndDecoration,
+  areUrisEqual,
+  isSafeLocalFileUri
+} from '../tabManager';
+
+import { formatBranchForDisplay, handleBranchChange } from '../extension';
+import { DecorationService } from '../decorationService';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test Utilities & Mocks
@@ -262,9 +286,12 @@ describe('Security & Resilience Audit Suite', () => {
     mockState.tabGroupsAll = [];
     mockState.textDocuments = [];
     mockState.visibleTextEditors = [];
+    mockState.activeTextEditor = undefined;
     mockState.closedTabs = [];
     mockState.statFailUris.clear();
+    mockState.statCalledUris = [];
     mockState.editorsShown = [];
+    mockState.commandsExecuted = [];
   });
 
   // ===========================================================================
@@ -298,8 +325,7 @@ describe('Security & Resilience Audit Suite', () => {
       assert.ok(isBranchIndexRecord(rawIndex));
     });
 
-    it('[VULN-03 REMEDIATED] Injective sanitization eliminates cross-branch collisions', () => {
-      // Injective escaping: 'feature/auth' -> 'feature_s_auth', 'feature__auth' -> 'feature_u__u_auth'
+    it('[VULN-03 & F-07 REMEDIATED] Strictly bijective sanitization eliminates cross-branch and control-byte collisions', () => {
       const sanitized1 = sanitizeBranchName('feature/auth');
       const sanitized2 = sanitizeBranchName('feature__auth');
       assert.notStrictEqual(sanitized1, sanitized2, 'Sanitized branch names must never collide');
@@ -307,6 +333,26 @@ describe('Security & Resilience Audit Suite', () => {
       const key1 = buildBranchKey(repo, 'feature/auth');
       const key2 = buildBranchKey(repo, 'feature__auth');
       assert.notStrictEqual(key1, key2, 'Storage keys for distinct branches must be unique');
+
+      // Control character bijective encoding (F-07)
+      const ctrlA = sanitizeBranchName('branch\x00a');
+      const plainA = sanitizeBranchName('brancha');
+      const literalHex = sanitizeBranchName('branch_x00_a');
+      assert.notStrictEqual(ctrlA, plainA, 'Control bytes must not strip to collide with plain branch names');
+      assert.notStrictEqual(ctrlA, literalHex, 'Encoded control bytes must not collide with literal _x00_');
+    });
+
+    it('[F-08 REMEDIATED] StorageManager.getBranchContext rejects records with mismatched repoRoot or branch identity', async () => {
+      const memento = new InMemoryMemento();
+      const storage = new StorageManager(memento);
+      const key = buildBranchKey(repo, 'main');
+
+      // Simulate hash/key collision where stored record belongs to a different repo or branch
+      await memento.update(key, makeValidRecord('/var/git/other-repo', 'main'));
+      assert.strictEqual(storage.getBranchContext(repo, 'main'), undefined);
+
+      await memento.update(key, makeValidRecord(repo, 'other-branch'));
+      assert.strictEqual(storage.getBranchContext(repo, 'main'), undefined);
     });
 
     it('Safely handles prototype pollution tokens as branch names without polluting Object.prototype', async () => {
@@ -355,7 +401,6 @@ describe('Security & Resilience Audit Suite', () => {
 
       for (const hostile of hostileBranches) {
         const key = buildBranchKey(repo, hostile);
-        // Key must remain isolated under the gitrecall namespace
         assert.ok(key.startsWith('gitrecall.v1.'), `Key does not have valid prefix: ${key}`);
 
         const record = makeValidRecord(repo, hostile);
@@ -367,7 +412,7 @@ describe('Security & Resilience Audit Suite', () => {
       }
     });
 
-    it('[VULN-04 REMEDIATED] Schema validation rejects NaN, float, and negative coordinates in CursorPosition', () => {
+    it('[VULN-04 & F-10 REMEDIATED] Schema validation rejects NaN, float, negative, and unbounded values in CursorPosition, TabRecord, and BranchContextRecord', () => {
       const nanCursor = { line: NaN, character: NaN };
       const floatCursor = { line: 1.7, character: 3.2 };
       const infCursor = { line: Infinity, character: -Infinity };
@@ -379,6 +424,31 @@ describe('Security & Resilience Audit Suite', () => {
       assert.strictEqual(isCursorPosition(infCursor), false, 'isCursorPosition must reject Infinity');
       assert.strictEqual(isCursorPosition(negCursor), false, 'isCursorPosition must reject negative numbers');
       assert.strictEqual(isCursorPosition(validCursor), true, 'isCursorPosition must accept valid coordinates');
+
+      // F-10: TabRecord viewColumn and tabIndex integer & bounds validation
+      const baseTab = {
+        uri: 'file:///workspace/a.ts',
+        viewColumn: 1,
+        tabIndex: 0,
+        isPinned: false,
+        cursor: validCursor
+      };
+      assert.strictEqual(isTabRecord(baseTab), true);
+      assert.strictEqual(isTabRecord({ ...baseTab, viewColumn: NaN }), false);
+      assert.strictEqual(isTabRecord({ ...baseTab, viewColumn: 0 }), false);
+      assert.strictEqual(isTabRecord({ ...baseTab, viewColumn: 10 }), false);
+      assert.strictEqual(isTabRecord({ ...baseTab, tabIndex: -1 }), false);
+      assert.strictEqual(isTabRecord({ ...baseTab, tabIndex: 1.5 }), false);
+
+      // F-10: BranchContextRecord tabs cap
+      const oversizedRecord = {
+        ...makeValidRecord(repo, 'main'),
+        tabs: Array.from({ length: MAX_TABS_PER_BRANCH + 1 }, (_, i) => ({
+          ...baseTab,
+          tabIndex: i
+        }))
+      };
+      assert.strictEqual(isBranchContextRecord(oversizedRecord), false, 'Must reject oversized tab arrays');
     });
 
     it('Rejects corrupted / adversarial record shapes', () => {
@@ -393,14 +463,14 @@ describe('Security & Resilience Audit Suite', () => {
   });
 
   // ===========================================================================
-  // TARGET 2: Zero-Tolerance Data Loss (Unsaved Buffers)
+  // TARGET 2: Zero-Tolerance Data Loss (Unsaved Buffers & New Branches)
   // ===========================================================================
   describe('Audit Target 2: Zero-Tolerance Data Loss (Unsaved Buffers)', () => {
     it('MATHEMATICAL PROOF: closeCleanTabs never closes a tab with tab.isDirty === true', async () => {
       const dirtyTabUri = 'file:///workspace/dirty.ts';
       const dirtyTab: MockTab = {
         input: new MockTabInputText(mockVscode.Uri.parse(dirtyTabUri)),
-        isDirty: true, // TAB IS DIRTY
+        isDirty: true,
         isPinned: false
       };
 
@@ -425,7 +495,6 @@ describe('Security & Resilience Audit Suite', () => {
 
     it('MATHEMATICAL PROOF: closeCleanTabs never closes a tab where underlying doc.isDirty === true', async () => {
       const docDirtyUri = 'file:///workspace/doc-dirty.ts';
-      // Tab reports clean, but document reports dirty (e.g. race window before tab UI updates)
       const tab: MockTab = {
         input: new MockTabInputText(mockVscode.Uri.parse(docDirtyUri)),
         isDirty: false,
@@ -434,7 +503,7 @@ describe('Security & Resilience Audit Suite', () => {
 
       const doc: MockTextDocument = {
         uri: mockVscode.Uri.parse(docDirtyUri),
-        isDirty: true, // DOCUMENT IS DIRTY
+        isDirty: true,
         lineCount: 5,
         lineAt: () => ({ text: '', range: {} })
       };
@@ -459,7 +528,6 @@ describe('Security & Resilience Audit Suite', () => {
         isPinned: false
       };
 
-      // Document is NOT present in workspace.textDocuments (e.g. file deleted by git checkout)
       mockState.tabGroupsAll = [{ tabs: [orphanTab] }];
       mockState.textDocuments = [];
 
@@ -474,7 +542,7 @@ describe('Security & Resilience Audit Suite', () => {
 
     it('FAIL-SAFE PROOF: Non-text tabs (diffs, webviews, settings) are never closed', async () => {
       const nonTextTab: MockTab = {
-        input: { description: 'Custom Webview Editor' }, // NOT instanceof TabInputText
+        input: { description: 'Custom Webview Editor' },
         isDirty: false,
         isPinned: false
       };
@@ -487,6 +555,45 @@ describe('Security & Resilience Audit Suite', () => {
       assert.strictEqual(mockState.closedTabs.length, 0, 'Non-text tab was closed!');
     });
 
+    it('[F-02 & F-03 REMEDIATED] Switching to a brand-new branch preserves open tabs and scopes operations to repoRoot', async () => {
+      const repoA = '/workspace/repo-a';
+      const repoB = '/workspace/repo-b';
+      const tabA: MockTab = {
+        input: new MockTabInputText(mockVscode.Uri.file(`${repoA}/main.ts`)),
+        isDirty: false,
+        isPinned: false
+      };
+      const tabB: MockTab = {
+        input: new MockTabInputText(mockVscode.Uri.file(`${repoB}/sub.ts`)),
+        isDirty: false,
+        isPinned: false
+      };
+      mockState.tabGroupsAll = [{ viewColumn: 1, tabs: [tabA, tabB] }];
+
+      const memento = new InMemoryMemento();
+      const storage = new StorageManager(memento);
+      const decoration = new DecorationService();
+
+      // Switch repo-a from 'main' to a brand-new branch 'feature/new' with no saved record
+      await handleBranchChange(
+        { repoRoot: repoA, previousBranch: 'main', currentBranch: 'feature/new' },
+        storage,
+        decoration,
+        () => {}
+      );
+
+      // 1. No tabs should be closed when switching to an unvisited branch (F-03)
+      assert.strictEqual(mockState.closedTabs.length, 0, 'New branch checkout must not wipe open clean tabs');
+
+      // 2. Saved record for repoA 'main' must only contain repoA's tab, not repoB's tab (F-02)
+      const savedMain = storage.getBranchContext(repoA, 'main');
+      assert.ok(savedMain);
+      assert.strictEqual(savedMain.tabs.length, 1);
+      assert.ok(savedMain.tabs[0].uri.includes('repo-a/main.ts'));
+
+      decoration.dispose();
+    });
+
     it('BATCH ENFORCEMENT: Exactly cleans clean tabs while preserving all dirty tabs in mixed batch', async () => {
       const totalTabs = 50;
       const tabs: MockTab[] = [];
@@ -495,7 +602,7 @@ describe('Security & Resilience Audit Suite', () => {
       for (let i = 0; i < totalTabs; i++) {
         const uriStr = `file:///workspace/file${i}.ts`;
         const uri = mockVscode.Uri.parse(uriStr);
-        const isDirty = i % 2 === 0; // Even are dirty, Odd are clean
+        const isDirty = i % 2 === 0;
 
         tabs.push({
           input: new MockTabInputText(uri),
@@ -516,7 +623,6 @@ describe('Security & Resilience Audit Suite', () => {
 
       await closeCleanTabs();
 
-      // Exactly 25 odd (clean) tabs should be closed
       assert.strictEqual(mockState.closedTabs.length, 25);
       for (const closedTab of mockState.closedTabs) {
         assert.strictEqual(closedTab.isDirty, false);
@@ -538,17 +644,12 @@ describe('Security & Resilience Audit Suite', () => {
       const memento = new InMemoryMemento();
       const storage = new StorageManager(memento);
 
-      // Developer visits branch A, then branch B, then branch C
       await storage.saveBranchContext(repo, 'feature-A', makeValidRecord(repo, 'feature-A'));
       await storage.saveBranchContext(repo, 'feature-B', makeValidRecord(repo, 'feature-B'));
 
-      // Both branches exist in storage
       assert.ok(storage.getBranchContext(repo, 'feature-A'), 'feature-A must exist');
       assert.ok(storage.getBranchContext(repo, 'feature-B'), 'feature-B must exist');
 
-      // Now developer switches from feature-B to feature-C.
-      // EXACT CALL MADE IN src/extension.ts:202-205:
-      // storage.pruneStaleEntries(repoRoot, [previousBranch, currentBranch])
       const previousBranch = 'feature-B';
       const currentBranch = 'feature-C';
       await storage.pruneStaleEntries(repo, [
@@ -556,9 +657,6 @@ describe('Security & Resilience Audit Suite', () => {
         ...(currentBranch ? [currentBranch] : [])
       ]);
 
-      // PROOF OF CATASTROPHIC DATA LOSS:
-      // feature-A was NOT in [previousBranch, currentBranch].
-      // StorageManager treated it as deleted from the repository and purged it!
       const featureARecord = storage.getBranchContext(repo, 'feature-A');
       assert.strictEqual(
         featureARecord,
@@ -579,7 +677,6 @@ describe('Security & Resilience Audit Suite', () => {
         });
       };
 
-      // Dispatch 3 overlapping cycles with differing execution times
       simulateBranchChange('branch-1', 40);
       simulateBranchChange('branch-2', 10);
       simulateBranchChange('branch-3', 20);
@@ -597,7 +694,6 @@ describe('Security & Resilience Audit Suite', () => {
     });
 
     it('Trailing-edge debounce cancels pending transitions when returning to origin branch', async () => {
-      // Simulating GitWatcher debounce logic
       let pendingTransition: { previousBranch: string | undefined } | null = null;
       let timer: NodeJS.Timeout | null = null;
       let lastKnownBranch = 'main';
@@ -620,17 +716,14 @@ describe('Security & Resilience Audit Suite', () => {
         }, 50);
       };
 
-      // Hop from main -> feature1 -> feature2 -> main all within 20ms
       triggerChange('feature-1');
       await new Promise(r => setTimeout(r, 10));
       triggerChange('feature-2');
       await new Promise(r => setTimeout(r, 10));
-      triggerChange('main'); // Hopped back to main before debounce finished
+      triggerChange('main');
 
-      // Wait for debounce timer to expire
       await new Promise(r => setTimeout(r, 80));
 
-      // Assert NO event was emitted because final branch equals origin branch
       assert.strictEqual(
         emittedEvent,
         null,
@@ -677,7 +770,7 @@ describe('Security & Resilience Audit Suite', () => {
           viewColumn: 1,
           tabIndex: 0,
           isPinned: false,
-          cursor: { line: 9999, character: 9999 } // Way out of bounds (doc has 10 lines)
+          cursor: { line: 9999, character: 9999 }
         }
       ];
 
@@ -686,22 +779,16 @@ describe('Security & Resilience Audit Suite', () => {
         restoredLine = line;
       });
 
-      // LineCount is 10 (0..9). 9999 must clamp to 9!
       assert.strictEqual(restoredLine, 9, 'Cursor line was not clamped to document lineCount - 1');
     });
 
-    it('Tolerates non-file URI schemes without crashing', async () => {
+    it('Tolerates non-file URI schemes without crashing or calling fs.stat', async () => {
       const strangeUris = [
         'git:/path/to/diff?ref=HEAD',
         'untitled:Untitled-1',
         'vscode-userdata:/settings.json',
         'output:extension-output-git'
       ];
-
-      // Mark all as failing stat so they skip cleanly
-      for (const u of strangeUris) {
-        mockState.statFailUris.add(u);
-      }
 
       const records = strangeUris.map((uri, i) => ({
         uri,
@@ -714,10 +801,12 @@ describe('Security & Resilience Audit Suite', () => {
       await assert.doesNotReject(async () => {
         await restoreTabs(records, () => {});
       });
+
+      assert.strictEqual(mockState.statCalledUris.length, 0, 'Non-file schemes must be rejected before fs.stat');
     });
 
-    it('[VULN-05 & VULN-06 REMEDIATED] captureCurrentState ignores non-file schemes and restoreTabs rejects UNC/non-file URIs', async () => {
-      // 1. Test captureCurrentState filters out non-file schemes
+    it('[VULN-05, VULN-06 & F-01 REMEDIATED] captureCurrentState ignores non-file/UNC schemes and restoreTabs rejects UNC URIs BEFORE fs.stat', async () => {
+      // 1. Test captureCurrentState filters out non-file schemes and UNC authorities
       const fileTab: MockTab = {
         input: new MockTabInputText(mockVscode.Uri.file('/workspace/real.ts')),
         isDirty: false,
@@ -733,23 +822,84 @@ describe('Security & Resilience Audit Suite', () => {
         isDirty: false,
         isPinned: false
       };
-      mockState.tabGroupsAll = [{ tabs: [fileTab, untitledTab, gitTab] }];
-      const captured = captureCurrentState();
-      assert.strictEqual(captured.length, 1, 'captureCurrentState must only capture file: scheme tabs');
-      assert.ok(captured[0].uri.startsWith('file://'));
-
-      // 2. Test restoreTabs rejects UNC paths with authority
-      const uncRecord = {
-        uri: 'file:////attacker-host/share/exploit.ts',
-        viewColumn: 1,
-        tabIndex: 0,
-        isPinned: false,
-        cursor: { line: 0, character: 0 }
+      const uncTab: MockTab = {
+        input: new MockTabInputText(mockVscode.Uri.parse('file://attacker-host/share/leak.ts')),
+        isDirty: false,
+        isPinned: false
       };
+      mockState.tabGroupsAll = [{ tabs: [fileTab, untitledTab, gitTab, uncTab] }];
+      const captured = captureCurrentState();
+      assert.strictEqual(captured.length, 1, 'captureCurrentState must only capture safe local file: tabs');
+      assert.strictEqual(captured[0].uri, 'file:///workspace/real.ts');
+
+      // 2. Test restoreTabs rejects both 2-slash and 4-slash UNC paths BEFORE calling fs.stat
+      mockState.statCalledUris = [];
+      const uncRecords = [
+        {
+          uri: 'file:////attacker-host/share/exploit.ts',
+          viewColumn: 1,
+          tabIndex: 0,
+          isPinned: false,
+          cursor: { line: 0, character: 0 }
+        },
+        {
+          uri: 'file://attacker-host/share/exploit2.ts',
+          viewColumn: 1,
+          tabIndex: 1,
+          isPinned: false,
+          cursor: { line: 0, character: 0 }
+        }
+      ];
       let editorOpened = false;
-      await restoreTabs([uncRecord], () => { editorOpened = true; });
+      await restoreTabs(uncRecords, () => { editorOpened = true; });
       assert.strictEqual(editorOpened, false, 'restoreTabs must reject UNC paths with authority');
       assert.strictEqual(mockState.editorsShown.length, 0, 'No editor should be opened for UNC path');
+      assert.strictEqual(mockState.statCalledUris.length, 0, 'fs.stat must NEVER be invoked on UNC paths');
+    });
+
+    it('[F-04, F-05, F-11, F-12 REMEDIATED] Enforces workspace bounds, escapes status bar codicons, preserves POSIX case, and restores pinned tabs', async () => {
+      // F-04: Workspace boundary check
+      assert.strictEqual(isSafeLocalFileUri('file:///workspace/repo/src/a.ts', undefined, '/workspace/repo'), true);
+      assert.strictEqual(isSafeLocalFileUri('file:///etc/passwd', undefined, '/workspace/repo'), false);
+      assert.strictEqual(isSafeLocalFileUri('file:///workspace/repo/../secret.txt', undefined, '/workspace/repo'), false);
+
+      // F-05: Status bar codicon escaping
+      const spoofBranch = 'main $(error) $(sync~spin) Alert';
+      const formatted = formatBranchForDisplay(spoofBranch);
+      assert.ok(!formatted.includes('$(') || formatted.includes('\\$('), 'Must escape $( codicon sequences');
+      assert.strictEqual(formatted, 'main \\$(error) \\$(sync~spin) Alert');
+
+      // F-11: Case sensitivity preserved on Linux, folded on Windows
+      assert.notStrictEqual(
+        normalizeRepoRoot('/home/dev/Repo', 'linux'),
+        normalizeRepoRoot('/home/dev/repo', 'linux')
+      );
+      assert.strictEqual(
+        normalizeRepoRoot('C:\\Users\\Dev\\Repo', 'win32'),
+        normalizeRepoRoot('c:/users/dev/repo', 'win32')
+      );
+      assert.strictEqual(
+        areUrisEqual('file:///workspace/Foo.ts', 'file:///workspace/foo.ts', 'linux'),
+        false
+      );
+      assert.strictEqual(
+        areUrisEqual('file:///C:/workspace/Foo.ts', 'file:///c:/workspace/foo.ts', 'win32'),
+        true
+      );
+
+      // F-12: Pinned tab restoration
+      mockState.commandsExecuted = [];
+      await restoreTabs([
+        {
+          uri: 'file:///workspace/pinned.ts',
+          viewColumn: 1,
+          tabIndex: 0,
+          isPinned: true,
+          cursor: { line: 0, character: 0 }
+        }
+      ]);
+      const pinCmd = mockState.commandsExecuted.find((c) => c.command === 'workbench.action.pinEditor');
+      assert.ok(pinCmd, 'workbench.action.pinEditor must be called when isPinned is true');
     });
 
     it('Restores tabs in exact saved order in background and focuses active tab last with line pulse', async () => {
@@ -774,10 +924,8 @@ describe('Security & Resilience Audit Suite', () => {
         { line: 5, character: 3 }
       );
 
-      // Exactly 4 showTextDocument calls: all 3 tabs sequentially in saved order in background, then active tab focused
       assert.strictEqual(mockState.editorsShown.length, 4);
 
-      // Phase 1 opens tabs in exact saved order (file1, activeFile, file2) with preserveFocus: true
       const first = mockState.editorsShown[0];
       const second = mockState.editorsShown[1];
       const third = mockState.editorsShown[2];
@@ -792,11 +940,9 @@ describe('Security & Resilience Audit Suite', () => {
       assert.strictEqual((third.uri as { toString(): string }).toString(), file2);
       assert.deepStrictEqual(third.options, { viewColumn: 1, preserveFocus: true, preview: false });
 
-      // Phase 2 brings active tab to focus with preserveFocus: false
       assert.strictEqual((focused.uri as { toString(): string }).toString(), activeFile);
       assert.deepStrictEqual(focused.options, { viewColumn: 1, preserveFocus: false, preview: false });
 
-      // Pulse decoration must ONLY be fired on the active tab with the activeCursor line (0-indexed line 5)
       assert.strictEqual(pulses.length, 1);
       assert.strictEqual(pulses[0].uri, activeFile);
       assert.strictEqual(pulses[0].line, 5);
@@ -821,7 +967,6 @@ describe('Security & Resilience Audit Suite', () => {
       assert.deepStrictEqual(mockState.editorsShown[0].options, { viewColumn: 1, preserveFocus: true, preview: false });
       assert.deepStrictEqual(mockState.editorsShown[1].options, { viewColumn: 1, preserveFocus: true, preview: false });
 
-      // In fallback mode (no activeTabUri), onFileRestored is called for each tab
       assert.strictEqual(pulses.length, 2);
       assert.strictEqual(pulses[0].line, 2);
       assert.strictEqual(pulses[1].line, 3);
@@ -831,7 +976,6 @@ describe('Security & Resilience Audit Suite', () => {
       const editor = await mockVscode.window.showTextDocument(mockVscode.Uri.file('/workspace/apply.ts'));
       let pulseLine = -1;
 
-      // Strict 0-indexed line 0 targeting
       applyCursorAndDecoration(editor as unknown as import('vscode').TextEditor, { line: 0, character: 0 }, (_ed, line) => {
         pulseLine = line;
       });
@@ -839,7 +983,6 @@ describe('Security & Resilience Audit Suite', () => {
       assert.strictEqual(editor.selection.active.character, 0);
       assert.strictEqual(pulseLine, 0);
 
-      // Line 7, character 4 targeting
       applyCursorAndDecoration(editor as unknown as import('vscode').TextEditor, { line: 7, character: 4 }, (_ed, line) => {
         pulseLine = line;
       });
@@ -847,14 +990,12 @@ describe('Security & Resilience Audit Suite', () => {
       assert.strictEqual(editor.selection.active.character, 4);
       assert.strictEqual(pulseLine, 7);
 
-      // Upper bounds clamping test with out-of-range line (lineCount is 10, so maxLine is 9)
       applyCursorAndDecoration(editor as unknown as import('vscode').TextEditor, { line: 999, character: 999 }, (_ed, line) => {
         pulseLine = line;
       });
       assert.strictEqual(editor.selection.active.line, 9);
       assert.strictEqual(pulseLine, 9);
 
-      // Lower bounds clamping test with negative values (clamps to 0)
       applyCursorAndDecoration(editor as unknown as import('vscode').TextEditor, { line: -10, character: -5 }, (_ed, line) => {
         pulseLine = line;
       });
@@ -872,10 +1013,8 @@ describe('Security & Resilience Audit Suite', () => {
         { uri: 'file:///workspace/delta.ts', viewColumn: 1, tabIndex: 3, isPinned: false, cursor: { line: 3, character: 0 } }
       ];
 
-      // Designate beta (middle index 1) as active tab
       await restoreTabs(tabs, undefined, 'file:///workspace/beta.ts', { line: 1, character: 5 });
 
-      // Check Phase 1 sequence: must be exactly alpha, beta, gamma, delta in order with preserveFocus: true
       const phase1Uris = mockState.editorsShown.slice(0, 4).map(e => (e.uri as { toString(): string }).toString());
       assert.deepStrictEqual(phase1Uris, [
         'file:///workspace/alpha.ts',
@@ -887,7 +1026,6 @@ describe('Security & Resilience Audit Suite', () => {
         assert.deepStrictEqual(mockState.editorsShown[i].options, { viewColumn: 1, preserveFocus: true, preview: false });
       }
 
-      // Check Phase 2: beta focused with preserveFocus: false
       assert.strictEqual(mockState.editorsShown.length, 5);
       const activeCall = mockState.editorsShown[4];
       assert.strictEqual((activeCall.uri as { toString(): string }).toString(), 'file:///workspace/beta.ts');
@@ -896,7 +1034,6 @@ describe('Security & Resilience Audit Suite', () => {
 
     it('Empty line cursor positioning: preserves 0-indexed line and character=0 without jumping', async () => {
       const editor = await mockVscode.window.showTextDocument(mockVscode.Uri.file('/workspace/empty-line.ts'));
-      // Simulate empty line at index 3
       editor.document.lineAt = (line: number) => {
         if (line === 3) {
           return { text: '', range: new MockRange(new MockPosition(3, 0), new MockPosition(3, 0)) };
@@ -910,12 +1047,10 @@ describe('Security & Resilience Audit Suite', () => {
         pulseLine = line;
       }, true);
 
-      // Must strictly preserve line 3 and character 0 without dropping to line 4
       assert.strictEqual(editor.selection.active.line, 3);
       assert.strictEqual(editor.selection.active.character, 0);
       assert.strictEqual(pulseLine, 3);
 
-      // Must reveal zero-width range at (3, 0)
       assert.strictEqual(editor.revealedRanges.length, 1);
       const revealed = editor.revealedRanges[0].range as MockRange;
       assert.strictEqual(revealed.start.line, 3);
@@ -949,11 +1084,9 @@ describe('Security & Resilience Audit Suite', () => {
 
       await restoreTabs(records, undefined, null);
 
-      // Only new-tab.ts should be shown; already-visible.ts is skipped
       assert.strictEqual(mockState.editorsShown.length, 1);
       assert.strictEqual((mockState.editorsShown[0].uri as { toString(): string }).toString(), 'file:///workspace/new-tab.ts');
 
-      // Cleanup
       mockState.visibleTextEditors = [];
     });
 
@@ -980,11 +1113,9 @@ describe('Security & Resilience Audit Suite', () => {
 
       await restoreTabs(records, undefined, null);
 
-      // inGroupUri is already in tabGroups, so only open-me.ts is opened
       assert.strictEqual(mockState.editorsShown.length, 1);
       assert.strictEqual((mockState.editorsShown[0].uri as { toString(): string }).toString(), 'file:///workspace/open-me.ts');
 
-      // Cleanup
       mockState.tabGroupsAll = [];
     });
 
@@ -1016,18 +1147,15 @@ describe('Security & Resilience Audit Suite', () => {
         pulseLine = line;
       }, activeFile, { line: 5, character: 2 });
 
-      // Because already-active.ts was both visible and active, zero showTextDocument calls are needed
       assert.strictEqual(mockState.editorsShown.length, 0);
       assert.strictEqual(pulseLine, 5);
 
-      // Cleanup
       mockState.activeTextEditor = undefined;
       mockState.visibleTextEditors = [];
     });
 
     it('CRLF sanitization: strips trailing \\r to prevent cursor jumping to next line', async () => {
       const editor = await mockVscode.window.showTextDocument(mockVscode.Uri.file('/workspace/crlf.ts'));
-      // Line with trailing \r (CRLF Windows file)
       editor.document.lineAt = (line: number) => {
         if (line === 2) {
           return { text: 'const a = 10;\r', range: new MockRange(new MockPosition(2, 0), new MockPosition(2, 14)) };
@@ -1038,12 +1166,10 @@ describe('Security & Resilience Audit Suite', () => {
         return { text: 'normal line', range: new MockRange(new MockPosition(line, 0), new MockPosition(line, 11)) };
       };
 
-      // When character is requested past the end of line, it must clamp to 13 (excluding \r), not 14
       applyCursorAndDecoration(editor as unknown as import('vscode').TextEditor, { line: 2, character: 99 }, undefined, true);
       assert.strictEqual(editor.selection.active.line, 2);
       assert.strictEqual(editor.selection.active.character, 13);
 
-      // On a CRLF empty line containing only '\r', character must be 0
       applyCursorAndDecoration(editor as unknown as import('vscode').TextEditor, { line: 3, character: 5 }, undefined, true);
       assert.strictEqual(editor.selection.active.line, 3);
       assert.strictEqual(editor.selection.active.character, 0);
@@ -1064,14 +1190,13 @@ describe('Security & Resilience Audit Suite', () => {
     });
 
     it('DecorationService.pulseLine on empty line produces zero-width range on safeLine', async () => {
-      const decService = new (await import('../decorationService')).DecorationService();
+      const decService = new DecorationService();
       let decorationRanges: unknown[] = [];
       const editor = {
         document: {
           lineCount: 5,
           lineAt: (line: number) => {
             if (line === 2) {
-              // Empty line
               return { text: '', range: new MockRange(new MockPosition(2, 0), new MockPosition(2, 0)) };
             }
             return { text: 'code', range: new MockRange(new MockPosition(line, 0), new MockPosition(line, 4)) };

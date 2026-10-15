@@ -1,26 +1,95 @@
 import * as vscode from 'vscode';
-import { TabRecord, CursorPosition } from './storage';
+import { TabRecord, CursorPosition, normalizeRepoRoot } from './storage';
+import { log, logWarn } from './logger';
+
+/**
+ * Validates that a URI represents a safe local `file:` resource with no remote UNC authority,
+ * no Windows UNC backslash prefix, no path traversal segments, and (if repoRoot is provided)
+ * resides within `repoRoot`.
+ */
+export function isSafeLocalFileUri(
+  uriStr: string,
+  parsedUri?: vscode.Uri,
+  repoRoot?: string,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  if (typeof uriStr !== 'string' || uriStr.length === 0) {
+    return false;
+  }
+
+  // Reject standard file://authority/path (two slashes followed by non-slash) or file:////host/share
+  if (/^file:\/\/(?!\/)/i.test(uriStr) || /^file:\/\/\/\/+/i.test(uriStr)) {
+    return false;
+  }
+
+  let uri: vscode.Uri;
+  try {
+    uri = parsedUri ?? vscode.Uri.parse(uriStr);
+  } catch (err) {
+    logWarn(`Failed to parse URI "${uriStr}"`, err);
+    return false;
+  }
+
+  if (uri.scheme !== 'file') {
+    return false;
+  }
+
+  if (uri.authority && uri.authority !== '') {
+    return false;
+  }
+
+  const rawFsPath = uri.fsPath || (uri as { path?: string }).path || '';
+  if (!rawFsPath) {
+    return false;
+  }
+
+  // Reject Windows UNC paths encoded in fsPath (e.g. \\server\share or //server/share)
+  if (/^(\\\\|\/\/)/.test(rawFsPath)) {
+    return false;
+  }
+
+  const normalizedFile = normalizeRepoRoot(rawFsPath.replace(/^file:\/\//i, ''), platform);
+  const segments = normalizedFile.split('/');
+  if (segments.includes('..')) {
+    return false;
+  }
+
+  if (repoRoot && repoRoot.trim().length > 0) {
+    const normalizedRoot = normalizeRepoRoot(repoRoot, platform);
+    if (
+      normalizedFile !== normalizedRoot &&
+      !normalizedFile.startsWith(`${normalizedRoot}/`)
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
 
 /**
  * Captures the current open editor tabs, split pane columns, tab indices,
  * pinned states, and active cursor coordinates across all tab groups.
+ * When `repoRoot` is provided, only captures tabs belonging to that repository root.
  */
 export function captureCurrentState(
-  activeCursorCache?: { uri: string; line: number; character: number } | null
+  activeCursorCache?: { uri: string; line: number; character: number } | null,
+  repoRoot?: string
 ): TabRecord[] {
   const records: TabRecord[] = [];
 
   try {
     for (const group of vscode.window.tabGroups.all) {
-      group.tabs.forEach((tab, index) => {
+      let groupTabIndex = 0;
+      group.tabs.forEach((tab) => {
         try {
           if (tab.input instanceof vscode.TabInputText) {
-            if (tab.input.uri.scheme !== 'file') {
+            const uri = tab.input.uri.toString();
+            if (!isSafeLocalFileUri(uri, tab.input.uri, repoRoot)) {
               return;
             }
-            const uri = tab.input.uri.toString();
             const viewColumn = typeof group.viewColumn === 'number' ? group.viewColumn : 1;
-            const tabIndex = index;
+            const tabIndex = groupTabIndex++;
             const isPinned = tab.isPinned;
 
             let cursor: CursorPosition = { line: 0, character: 0 };
@@ -56,12 +125,12 @@ export function captureCurrentState(
             });
           }
         } catch (tabError) {
-          console.warn('[GitRecall] Error capturing individual tab state:', tabError);
+          logWarn('Error capturing individual tab state', tabError);
         }
       });
     }
   } catch (groupError) {
-    console.warn('[GitRecall] Error enumerating tab groups during capture:', groupError);
+    logWarn('Error enumerating tab groups during capture', groupError);
   }
 
   return records;
@@ -72,10 +141,12 @@ export function captureCurrentState(
  * Dirty files are strictly preserved to protect against data loss.
  * If preserveUris is provided, tabs matching those URIs are also preserved
  * to eliminate screen flicker and avoid closing tabs needed by the incoming branch.
+ * If repoRoot is provided, only closes tabs belonging to that repository root.
  */
 export async function closeCleanTabs(
   tabs?: readonly vscode.Tab[],
-  preserveUris?: readonly string[]
+  preserveUris?: readonly string[],
+  repoRoot?: string
 ): Promise<void> {
   try {
     const targetTabs: readonly vscode.Tab[] =
@@ -97,6 +168,11 @@ export async function closeCleanTabs(
 
         const uriStr = tab.input.uri.toString();
 
+        // When scoped to a repository root, never close tabs outside that repository
+        if (repoRoot && !isSafeLocalFileUri(uriStr, tab.input.uri, repoRoot)) {
+          continue;
+        }
+
         // Preserve tabs that belong to the incoming branch to eliminate blank screen flicker
         if (preserveUris && preserveUris.some((pUri) => areUrisEqual(pUri, uriStr))) {
           continue;
@@ -111,7 +187,7 @@ export async function closeCleanTabs(
 
         cleanTabs.push(tab);
       } catch (tabError) {
-        console.warn('[GitRecall] Error checking tab dirty state:', tabError);
+        logWarn('Error checking tab dirty state', tabError);
         // Fail safe: do not close tab on evaluation failure
       }
     }
@@ -120,7 +196,7 @@ export async function closeCleanTabs(
       await vscode.window.tabGroups.close(cleanTabs, true);
     }
   } catch (error) {
-    console.warn('[GitRecall] Failed to batch-close clean tabs:', error);
+    logWarn('Failed to batch-close clean tabs', error);
   }
 }
 
@@ -152,7 +228,8 @@ export function applyCursorAndDecoration(
     let lineLength = 0;
     try {
       lineLength = editor.document.lineAt(targetLine).text.replace(/\r$/, '').length;
-    } catch {
+    } catch (lineErr) {
+      logWarn(`Failed to read line ${targetLine} length during cursor restoration`, lineErr);
       lineLength = 0;
     }
 
@@ -179,18 +256,23 @@ export function applyCursorAndDecoration(
       try {
         onFileRestored(editor, targetLine);
       } catch (cbError) {
-        console.warn('[GitRecall] Error in onFileRestored callback:', cbError);
+        logWarn('Error in onFileRestored callback', cbError);
       }
     }
   } catch (error) {
-    console.warn('[GitRecall] Error in applyCursorAndDecoration:', error);
+    logWarn('Error in applyCursorAndDecoration', error);
   }
 }
 
 /**
  * Normalizes and compares two URI strings for equality.
+ * Preserves case on case-sensitive POSIX platforms while folding case on Windows.
  */
-export function areUrisEqual(uriA: string | undefined | null, uriB: string | undefined | null): boolean {
+export function areUrisEqual(
+  uriA: string | undefined | null,
+  uriB: string | undefined | null,
+  platform: NodeJS.Platform = process.platform
+): boolean {
   if (!uriA || !uriB) {
     return uriA === uriB;
   }
@@ -200,17 +282,20 @@ export function areUrisEqual(uriA: string | undefined | null, uriB: string | und
   try {
     const parsedA = vscode.Uri.parse(uriA);
     const parsedB = vscode.Uri.parse(uriB);
-    if (parsedA.scheme !== parsedB.scheme) {
+    if (parsedA.scheme.toLowerCase() !== parsedB.scheme.toLowerCase()) {
       return false;
     }
-    const pathA = (parsedA.fsPath || parsedA.path || '').replace(/\\/g, '/').toLowerCase();
-    const pathB = (parsedB.fsPath || parsedB.path || '').replace(/\\/g, '/').toLowerCase();
-    if (pathA && pathB) {
-      return pathA === pathB;
+    const rawPathA = (parsedA.fsPath || (parsedA as { path?: string }).path || '').replace(/\\/g, '/');
+    const rawPathB = (parsedB.fsPath || (parsedB as { path?: string }).path || '').replace(/\\/g, '/');
+    if (rawPathA && rawPathB) {
+      return normalizeRepoRoot(rawPathA, platform) === normalizeRepoRoot(rawPathB, platform);
     }
-    return parsedA.toString().toLowerCase() === parsedB.toString().toLowerCase();
-  } catch {
-    return uriA.toLowerCase() === uriB.toLowerCase();
+    return platform === 'win32'
+      ? parsedA.toString().toLowerCase() === parsedB.toString().toLowerCase()
+      : parsedA.toString() === parsedB.toString();
+  } catch (err) {
+    logWarn('Error comparing URIs in areUrisEqual', err);
+    return platform === 'win32' ? uriA.toLowerCase() === uriB.toLowerCase() : uriA === uriB;
   }
 }
 
@@ -235,8 +320,8 @@ function isTabInGroup(uriStr: string, viewColumn?: number): boolean {
         }
       }
     }
-  } catch {
-    // Fail open if tabGroups enumeration fails
+  } catch (err) {
+    logWarn('Failed to enumerate tabGroups in isTabInGroup', err);
   }
   return false;
 }
@@ -244,43 +329,59 @@ function isTabInGroup(uriStr: string, viewColumn?: number): boolean {
 /**
  * Restores saved tabs in two phases:
  *
+ * Pre-filter:
+ *   Sorts records by (viewColumn, tabIndex) and validates all URIs (scheme === 'file',
+ *   empty authority, no UNC paths, and optional repoRoot containment) BEFORE invoking
+ *   `vscode.workspace.fs.stat()` so unsafe URIs never trigger filesystem or SMB requests.
+ *
  * Phase 1 – Background tabs
- *   All file-existence checks are parallelised upfront (one Promise.allSettled batch) to
- *   eliminate N sequential async round-trips and reduce startup lag.
- *   Each valid tab is opened with { preview: false, preserveFocus: false } so VS Code
- *   advances its insertion cursor left-to-right, producing the correct tab bar order.
- *   (preserveFocus: true inserts every new tab next to the still-focused first tab,
- *   reversing the order after position 0.)
+ *   Opens valid tabs in saved order with `{ preview: false, preserveFocus: true }`.
  *
  * Phase 2 – Active tab
- *   After Phase 1 the tab bar contains all tabs in their correct saved positions.
- *   We locate the active tab's ACTUAL current bar index by scanning tabGroups and use
- *   workbench.action.openEditorAtIndex to navigate to it.  That command calls
- *   focusEditorAtIndex internally which only changes focus — it does NOT reinsert the tab
- *   and therefore cannot cause it to drift to the end of the bar on terminal clicks.
- *   showTextDocument is only used as a fallback when the tab is not yet in the group.
- *   The cursor is applied immediately (reduces perceived lag) and again after 50 ms
- *   (overwrites VS Code's own async view-state restoration which runs on a real setTimeout).
+ *   Focuses the saved active tab, restores pinned status if needed, adjusts its tab bar
+ *   position relative to existing tabs in the group, and applies cursor + line pulse.
  */
 export async function restoreTabs(
   records: TabRecord[],
   onFileRestored?: (editor: vscode.TextEditor, line: number) => void,
   activeTabUri?: string | null,
-  activeCursor?: CursorPosition | null
+  activeCursor?: CursorPosition | null,
+  repoRoot?: string
 ): Promise<void> {
   const hasActiveTab = typeof activeTabUri === 'string' && activeTabUri.length > 0;
 
-  // ── Pre-filter: parallel existence check ──
-  // All stat calls run concurrently so N tabs cost one round-trip, not N.
-  const uris = records.map((r) => vscode.Uri.parse(r.uri));
-  const statResults = await Promise.allSettled(uris.map((u) => vscode.workspace.fs.stat(u)));
-  const validRecords = records.filter((_, i) => statResults[i].status === 'fulfilled');
+  // Sort records by viewColumn and tabIndex so restoration strictly follows original order
+  const orderedRecords = [...records].sort(
+    (a, b) => (a.viewColumn ?? 1) - (b.viewColumn ?? 1) || (a.tabIndex ?? 0) - (b.tabIndex ?? 0)
+  );
+
+  // ── Pre-filter: validate scheme, authority, and workspace bounds BEFORE fs.stat ──
+  const preValidated = orderedRecords.map((r) => {
+    try {
+      const parsed = vscode.Uri.parse(r.uri);
+      const safe = isSafeLocalFileUri(r.uri, parsed, repoRoot);
+      return { record: r, parsed: safe ? parsed : null };
+    } catch (err) {
+      logWarn(`Skipping malformed URI during restore pre-filter: "${r.uri}"`, err);
+      return { record: r, parsed: null };
+    }
+  });
+
+  const statResults = await Promise.allSettled(
+    preValidated.map((item) =>
+      item.parsed
+        ? vscode.workspace.fs.stat(item.parsed)
+        : Promise.reject(new Error('UnsafeOrInvalidUri'))
+    )
+  );
+
+  const validRecords = orderedRecords.filter((_, i) => statResults[i].status === 'fulfilled');
 
   // ── Phase 1: Open all valid tabs in exact saved order ──
   for (const record of validRecords) {
     try {
       const uri = vscode.Uri.parse(record.uri);
-      if (uri.scheme !== 'file' || (uri.authority && uri.authority !== '')) {
+      if (!isSafeLocalFileUri(record.uri, uri, repoRoot)) {
         continue;
       }
 
@@ -311,6 +412,14 @@ export async function restoreTabs(
         });
       }
 
+      if (record.isPinned) {
+        try {
+          await vscode.commands.executeCommand('workbench.action.pinEditor');
+        } catch (pinErr) {
+          logWarn(`Best-effort pinEditor failed for "${record.uri}"`, pinErr);
+        }
+      }
+
       if (targetEditor) {
         applyCursorAndDecoration(
           targetEditor,
@@ -320,7 +429,7 @@ export async function restoreTabs(
         );
       }
     } catch (recordError) {
-      console.warn(`[GitRecall] Error restoring record for "${record.uri}":`, recordError);
+      logWarn(`Error restoring record for "${record.uri}"`, recordError);
     }
   }
 
@@ -331,21 +440,29 @@ export async function restoreTabs(
 
   try {
     const activeUri = vscode.Uri.parse(activeTabUri!);
-    if (activeUri.scheme !== 'file' || (activeUri.authority && activeUri.authority !== '')) {
+    if (!isSafeLocalFileUri(activeTabUri!, activeUri, repoRoot)) {
       return;
     }
 
     // Use the pre-computed stat result for the active file
-    const activeRecordIdx = records.findIndex((r) => areUrisEqual(r.uri, activeTabUri!));
+    const activeRecordIdx = orderedRecords.findIndex((r) => areUrisEqual(r.uri, activeTabUri!));
     if (activeRecordIdx < 0 || statResults[activeRecordIdx].status !== 'fulfilled') {
-      console.info(`[GitRecall] Active file no longer exists on disk, skipping: ${activeTabUri}`);
+      log(`Active file no longer exists on disk, skipping: ${activeTabUri}`);
       return;
     }
 
-    const activeRecord = records[activeRecordIdx];
+    const activeRecord = orderedRecords[activeRecordIdx];
     const targetViewColumn = activeRecord?.viewColumn;
     const targetCursor = activeCursor ?? activeRecord?.cursor ?? null;
-    const savedTabIndex = activeRecord?.tabIndex ?? 0;
+
+    // Compute target tab index among valid existing tabs in the same viewColumn
+    const validGroupRecords = validRecords.filter(
+      (r) => (r.viewColumn ?? 1) === (targetViewColumn ?? 1)
+    );
+    const validGroupIndex = validGroupRecords.findIndex((r) =>
+      areUrisEqual(r.uri, activeTabUri!)
+    );
+    const savedTabIndex = validGroupIndex >= 0 ? validGroupIndex : (activeRecord?.tabIndex ?? 0);
 
     // ── Focus ──
     let activeEditor: vscode.TextEditor | undefined;
@@ -367,7 +484,17 @@ export async function restoreTabs(
     // Promote from any residual preview state so terminal clicks cannot demote the tab
     try {
       await vscode.commands.executeCommand('workbench.action.keepEditor');
-    } catch { /* best effort in test environments */ }
+    } catch (keepErr) {
+      logWarn('Best-effort keepEditor command failed', keepErr);
+    }
+
+    if (activeRecord?.isPinned) {
+      try {
+        await vscode.commands.executeCommand('workbench.action.pinEditor');
+      } catch (pinErr) {
+        logWarn('Best-effort pinEditor command failed on active tab', pinErr);
+      }
+    }
 
     // ── Position correction ──
     // Use the native VS Code command 'moveActiveEditor' to slide the active tab back to its
@@ -393,42 +520,44 @@ export async function restoreTabs(
           });
         }
       }
-    } catch {
-      // Repositioning is best-effort
+    } catch (moveErr) {
+      logWarn('Best-effort moveActiveEditor repositioning failed', moveErr);
     }
 
     // ── Cursor restoration ──
     applyCursorAndDecoration(activeEditor, targetCursor, onFileRestored, true);
 
   } catch (activeError) {
-    console.warn(`[GitRecall] Error restoring active tab for "${activeTabUri}":`, activeError);
+    logWarn(`Error restoring active tab for "${activeTabUri}"`, activeError);
   }
 }
-
 
 /**
  * TabManager class wrapping tab capture, clean desk, and restoration.
  */
 export class TabManager {
   captureCurrentState(
-    activeCursorCache?: { uri: string; line: number; character: number } | null
+    activeCursorCache?: { uri: string; line: number; character: number } | null,
+    repoRoot?: string
   ): TabRecord[] {
-    return captureCurrentState(activeCursorCache);
+    return captureCurrentState(activeCursorCache, repoRoot);
   }
 
   async closeCleanTabs(
     tabs?: readonly vscode.Tab[],
-    preserveUris?: readonly string[]
+    preserveUris?: readonly string[],
+    repoRoot?: string
   ): Promise<void> {
-    return closeCleanTabs(tabs, preserveUris);
+    return closeCleanTabs(tabs, preserveUris, repoRoot);
   }
 
   async restoreTabs(
     records: TabRecord[],
     onFileRestored?: (editor: vscode.TextEditor, line: number) => void,
     activeTabUri?: string | null,
-    activeCursor?: CursorPosition | null
+    activeCursor?: CursorPosition | null,
+    repoRoot?: string
   ): Promise<void> {
-    return restoreTabs(records, onFileRestored, activeTabUri, activeCursor);
+    return restoreTabs(records, onFileRestored, activeTabUri, activeCursor, repoRoot);
   }
 }

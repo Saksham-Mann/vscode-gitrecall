@@ -2,7 +2,7 @@
   "name": "gitrecall",
   "displayName": "Git Recall: Restore Branch Tabs, Layouts & State",
   "description": "Automatically restore your tabs, split-pane layout, and cursor positions when switching Git branches. Local-first, zero telemetry, seamless context recovery.",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "publisher": "Saksham-Mann",
   "publisherDisplayName": "Saksham Mann",
   "author": {

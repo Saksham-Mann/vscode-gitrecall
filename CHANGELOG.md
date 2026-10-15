@@ -5,6 +5,19 @@ All notable changes to the **GitRecall** extension will be documented in this fi
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-10-15
+
+### Added
+
+- **Smart New-Branch Transition**: Preserves open tabs when checking out an unvisited branch, while automatically closing clean tabs for files that do not exist on the new branch to avoid crossed-out tabs.
+- **Multi-Repository Scoping**: Tab capture, Clean Desk, and restoration are strictly isolated to the repository root where the checkout occurred.
+- **Pinned Tab Persistence**: Restores pinned editor tab state when switching back to a branch.
+- **Pre-Stat Host Boundary Hardening**: Pre-filters URIs to reject Windows UNC paths (`file://remote/share`), path traversals (`..`), and virtual schemes before querying filesystem stats.
+- **Bijective Key Sanitization**: Prefix-free character escaping (`_` $\to$ `_u_`, `/` $\to$ `_s_`, control bytes $\to$ `_xNN_`) and `detached:<sha>` namespace eliminate cross-branch storage collisions.
+- **DoS Protection**: Coordinates validated as integers and tab snapshots capped at `MAX_TABS_PER_BRANCH = 200`.
+- **Status Bar UI Sanitization**: Escapes `$(...)` codicon sequences to prevent UI spoofing in the status bar.
+- **Centralized Diagnostic Logger**: Centralized OutputChannel logging with control-character sanitization.
+
 ## [1.0.3] - 2026-09-05
 
 ### Changed
